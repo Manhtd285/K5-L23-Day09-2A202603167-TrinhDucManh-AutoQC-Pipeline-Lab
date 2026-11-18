@@ -27,13 +27,125 @@ Bẫy cần nghĩ tới (có test cho từng cái)
 
 Gợi ý: `yaml.safe_load / safe_dump`.
 """
-from collections import defaultdict  # noqa: F401
+from collections import defaultdict
 
-import yaml  # noqa: F401
+import yaml
 
-from ..common import ERROR, parse_yolo_line  # noqa: F401
+from ..common import ERROR, parse_yolo_line
+
+REMOVE_IMAGE_CODES = {
+    "DUP_IMAGE_EXACT",
+    "DUP_IMAGE_NEAR",
+    "LEAK_TEST",
+    "CORRUPT_IMAGE",
+    "BAD_SIZE",
+}
+DROP_LINE_CODES = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+
+
+def _fix_row(image, line, action, before, after):
+    return {
+        "image": image,
+        "line": "" if line is None else line,
+        "action": action,
+        "before": before,
+        "after": after,
+    }
 
 
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    err_issues = [i for i in issues if i.severity == ERROR]
+    fixes = []
+    removed = set()
+
+    # 1. Xoá ảnh lỗi ở cửa vào (ảnh hỏng, kích thước nhỏ, trùng, rò rỉ test)
+    for i in err_issues:
+        if i.code in REMOVE_IMAGE_CODES:
+            stem = i.image
+            if stem in removed:
+                continue
+            ip = ds.image_path(stem)
+            if ip is not None and ip.exists():
+                ip.unlink()
+            lp = ds.label_path(stem)
+            if lp.exists():
+                lp.unlink()
+            removed.add(stem)
+            fixes.append(_fix_row(stem, None, "remove_image", stem, "(đã xoá ảnh và nhãn)"))
+
+    # 2. Sửa tên lớp trong data.yaml (tối đa 1 lần cho cả batch)
+    if any(i.code == "BAD_CLASS_NAME" for i in err_issues):
+        before_names = ds.yaml_names()
+        data = {}
+        if ds.yaml_path.exists():
+            data = yaml.safe_load(ds.yaml_path.read_text(encoding="utf-8")) or {}
+        if not isinstance(data, dict):
+            data = {}
+        new_names = {idx: name for idx, name in enumerate(cfg["classes"])}
+        data["names"] = new_names
+        ds.yaml_path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        fixes.append(_fix_row("data.yaml", None, "rename_classes", str(before_names), str(new_names)))
+
+    # 3. Ảnh thiếu file nhãn -> chuyển người gán, KHÔNG tạo file rỗng
+    for i in err_issues:
+        if i.code == "MISSING_LABEL_FILE" and i.image not in removed:
+            fixes.append(_fix_row(i.image, None, "needs_label", "(không có file)", "chuyển người gán"))
+
+    # 4. Gom lỗi cấp dòng theo từng file nhãn rồi xử lý một lần
+    per_file = defaultdict(lambda: defaultdict(set))
+    for i in err_issues:
+        if i.image in removed or i.line is None:
+            continue
+        if i.code in DROP_LINE_CODES or i.code == "BOX_OUT_OF_IMAGE":
+            per_file[i.image][i.line].add(i.code)
+
+    for stem in sorted(per_file):
+        lp = ds.label_path(stem)
+        if not lp.exists():
+            continue
+        orig_lines = lp.read_text(encoding="utf-8", errors="replace").splitlines()
+        new_lines = []
+        changed = False
+
+        for line_no, raw_ln in enumerate(orig_lines, 1):
+            codes = per_file[stem].get(line_no)
+            if not codes:
+                new_lines.append(raw_ln)
+                continue
+
+            if codes & DROP_LINE_CODES:
+                fixes.append(_fix_row(stem, line_no, "drop_line", raw_ln, "(đã xoá)"))
+                changed = True
+                continue
+
+            if "BOX_OUT_OF_IMAGE" in codes:
+                try:
+                    cls_id, cx, cy, w, h = parse_yolo_line(raw_ln)
+                except ValueError:
+                    fixes.append(_fix_row(stem, line_no, "drop_line", raw_ln, "(đã xoá)"))
+                    changed = True
+                    continue
+
+                x1 = max(0.0, min(1.0, cx - w / 2))
+                y1 = max(0.0, min(1.0, cy - h / 2))
+                x2 = max(0.0, min(1.0, cx + w / 2))
+                y2 = max(0.0, min(1.0, cy + h / 2))
+                nw = x2 - x1
+                nh = y2 - y1
+
+                if nw <= 1e-6 or nh <= 1e-6:
+                    fixes.append(_fix_row(stem, line_no, "drop_line", raw_ln, "(đã xoá: ngoài ảnh)"))
+                    changed = True
+                    continue
+
+                ncx, ncy = (x1 + x2) / 2, (y1 + y2) / 2
+                clipped = f"{cls_id} {ncx:.6f} {ncy:.6f} {nw:.6f} {nh:.6f}"
+                new_lines.append(clipped)
+                fixes.append(_fix_row(stem, line_no, "clip_box", raw_ln, clipped))
+                changed = True
+
+        if changed:
+            content = "\n".join(new_lines) + "\n" if new_lines else ""
+            lp.write_text(content, encoding="utf-8")
+
+    return fixes
